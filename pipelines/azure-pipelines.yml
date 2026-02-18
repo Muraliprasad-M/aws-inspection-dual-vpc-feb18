@@ -1,0 +1,69 @@
+trigger:
+  branches:
+    include: [ main ]
+
+variables:
+  TF_VERSION: '1.7.5'
+  AWS_REGION: 'eu-west-2'
+  TF_WORK_DIR: 'infra'
+  ENV_NAME: 'dev'
+
+stages:
+- stage: ValidatePlan
+  displayName: Validate & Plan
+  jobs:
+  - job: plan
+    pool:
+      vmImage: 'ubuntu-22.04'
+    steps:
+    - bash: |
+        curl -sLo terraform.zip https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip
+        sudo unzip -o terraform.zip -d /usr/local/bin
+        terraform -version
+      displayName: Install Terraform
+
+    - task: AWSCLI@1
+      displayName: Verify AWS identity (OIDC)
+      inputs:
+        awsCredentials: 'aws-oidc-euw2'
+        regionName: '$(AWS_REGION)'
+        awsCommand: 'sts get-caller-identity'
+
+    - bash: |
+        set -e
+        cd $(TF_WORK_DIR)
+        terraform init -backend-config=../environments/$(ENV_NAME)/state.hcl
+        terraform validate
+        terraform plan -var-file=../environments/$(ENV_NAME)/terraform.tfvars -out=tfplan
+      displayName: Terraform init/validate/plan
+
+    - publish: infra/tfplan
+      artifact: tfplan
+
+- stage: Apply
+  displayName: Apply (approval)
+  dependsOn: ValidatePlan
+  condition: succeeded()
+  jobs:
+  - deployment: apply
+    environment: 'dual-vpc-inspected-$(ENV_NAME)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AWSCLI@1
+            displayName: Verify AWS identity (OIDC)
+            inputs:
+              awsCredentials: 'aws-oidc-euw2'
+              regionName: '$(AWS_REGION)'
+              awsCommand: 'sts get-caller-identity'
+
+          - download: current
+            artifact: tfplan
+
+          - bash: |
+              set -e
+              cd $(TF_WORK_DIR)
+              terraform init -backend-config=../environments/$(ENV_NAME)/state.hcl
+              terraform apply -auto-approve $(Pipeline.Workspace)/tfplan/tfplan
+            displayName: Terraform apply
